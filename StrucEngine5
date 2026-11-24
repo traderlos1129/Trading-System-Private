@@ -1,0 +1,316 @@
+//@version=6
+indicator("Structure Engine - Modules 1-3 (Swing + Liquidity + Events) v5", shorttitle="StructEng5", overlay=true, max_lines_count=400, max_labels_count=400)
+
+pivotLeftLen   = input.int(5, "Pivot left length", minval=1, group="Module 1 - Swing Structure")
+pivotRightLen  = input.int(5, "Pivot right length", minval=1, group="Module 1 - Swing Structure")
+showPivotMarkers = input.bool(false, "Show PH/PL pivot markers", group="Module 1 - Swing Structure")
+showConfirmLag    = input.bool(false, "Show pre-confirmation reference segment (dotted)", group="Module 1 - Swing Structure")
+
+maxLevelsStored    = input.int(40, "Max levels stored per side (internal tracking cap)", minval=5, maxval=200, group="Module 2-3 - Liquidity")
+maxLevelsDisplayed = input.int(5, "Max RECENT levels DISPLAYED per side (display only - all levels still tracked)", minval=1, maxval=40, group="Module 2-3 - Liquidity")
+retireAfterBars    = input.int(50, "Bars after reclaim before retirement (display only)", minval=5, group="Module 2-3 - Liquidity")
+maxLabelsStored    = input.int(200, "Max labels retained (oldest pruned)", minval=20, maxval=400, group="Module 2-3 - Liquidity")
+maxHistoricalLines = input.int(80, "Max pre-confirmation connector lines retained", minval=10, maxval=300, group="Module 2-3 - Liquidity")
+
+fullDiagnosticMode = input.bool(false, "FULL DIAGNOSTIC MODE (verbose labels, bold lines, ignores display cap)", group="Display Mode")
+
+showBuySide  = input.bool(true, "Show buy-side liquidity (above swing highs)", group="Display")
+showSellSide = input.bool(true, "Show sell-side liquidity (below swing lows)", group="Display")
+
+showReachedMarkers      = input.bool(false, "Show 'reached' markers", group="Display")
+showTradedBeyondMarkers = input.bool(false, "Show 'traded beyond' markers", group="Display")
+showClosedBeyondMarkers = input.bool(true,  "Show closed-beyond markers (circle in clean mode)", group="Display")
+showReclaimedMarkers    = input.bool(true,  "Show reclaimed markers (circle in clean mode)", group="Display")
+showWickSweepMarkers    = input.bool(true,  "Show wick-sweep markers (cross in clean mode)", group="Display")
+showEqualCloseMarkers   = input.bool(false, "Show 'close == level price' markers", group="Display")
+
+showEventLogTable = input.bool(false, "Show chronological event log table (always shows ALL events, never capped by display mode)", group="Event Log")
+maxEventLogRows   = input.int(15, "Event log rows kept (FIFO)", minval=5, maxval=50, group="Event Log")
+
+colActive     = input.color(color.blue, "Active level color", group="Colors")
+colBreached   = input.color(color.orange, "Breached (confirmed close beyond)", group="Colors")
+colReclaimed  = input.color(color.teal, "Reclaimed color", group="Colors")
+colRetired    = input.color(color.gray, "Retired color", group="Colors")
+colWickSweep  = input.color(color.purple, "Wick-sweep (no close-beyond) color", group="Colors")
+colHistorical = input.color(color.new(color.gray, 70), "Pre-confirmation reference color", group="Colors")
+colEqual      = input.color(color.yellow, "Equal-close (unresolved) color", group="Colors")
+
+type LiqLevel
+    float  price
+    int    pivotBarIndex
+    int    pivotBarTime
+    int    confirmBarIndex
+    int    confirmBarTime
+    bool   reached = false
+    int    reachedBarIndex = na
+    int    reachedBarTime = na
+    bool   tradedBeyond = false
+    int    tradedBeyondBarIndex = na
+    int    tradedBeyondBarTime = na
+    string excursionState = "none"
+    int    wickSweepCount = 0
+    int    lastWickSweepBarIndex = na
+    int    lastWickSweepBarTime = na
+    bool   closedBeyond = false
+    int    closedBeyondBarIndex = na
+    int    closedBeyondBarTime = na
+    bool   reclaimed = false
+    int    reclaimedBarIndex = na
+    int    reclaimedBarTime = na
+    bool   forceRetired = false
+    string state = "active"
+    bool   displayed = true
+    line   historicalRef = na
+    line   lineRef = na
+
+type EventLogEntry
+    string side
+    string eventType
+    float  price
+    int    barIndex
+    int    barTime
+    int    occurrence
+
+var array<LiqLevel> buySideLevels   = array.new<LiqLevel>()
+var array<LiqLevel> sellSideLevels  = array.new<LiqLevel>()
+var array<EventLogEntry> eventLog   = array.new<EventLogEntry>()
+var array<label> eventLabels        = array.new<label>()
+var array<line> historicalLines     = array.new<line>()
+
+logEvent(side, eventType, px, bIdx, bTime, occ) =>
+    entry = EventLogEntry.new(side=side, eventType=eventType, price=px, barIndex=bIdx, barTime=bTime, occurrence=occ)
+    array.push(eventLog, entry)
+    if array.size(eventLog) > maxEventLogRows
+        array.shift(eventLog)
+
+trackLabel(lbl) =>
+    array.push(eventLabels, lbl)
+    if array.size(eventLabels) > maxLabelsStored
+        label.delete(array.shift(eventLabels))
+    lbl
+
+trackHistoricalLine(ln) =>
+    array.push(historicalLines, ln)
+    if array.size(historicalLines) > maxHistoricalLines
+        line.delete(array.shift(historicalLines))
+    ln
+
+ph = ta.pivothigh(high, pivotLeftLen, pivotRightLen)
+pl = ta.pivotlow(low, pivotLeftLen, pivotRightLen)
+
+if barstate.isconfirmed
+    if showPivotMarkers and not na(ph)
+        trackLabel(label.new(bar_index - pivotRightLen, high[pivotRightLen], text="PH", style=label.style_label_down, color=color.new(color.silver, 30), textcolor=color.black, size=size.tiny))
+    if showPivotMarkers and not na(pl)
+        trackLabel(label.new(bar_index - pivotRightLen, low[pivotRightLen], text="PL", style=label.style_label_up, color=color.new(color.silver, 30), textcolor=color.black, size=size.tiny))
+
+if barstate.isconfirmed
+    if not na(ph) and showBuySide
+        LiqLevel lvl = LiqLevel.new(price=ph, pivotBarIndex=bar_index - pivotRightLen, pivotBarTime=time[pivotRightLen], confirmBarIndex=bar_index, confirmBarTime=time)
+        if showConfirmLag
+            lvl.historicalRef := trackHistoricalLine(line.new(bar_index - pivotRightLen, ph, bar_index, ph, color=colHistorical, style=line.style_dotted))
+        lvl.lineRef := line.new(bar_index, ph, bar_index, ph, color=color.new(colActive, 60), width=1, extend=extend.right)
+        array.push(buySideLevels, lvl)
+        logEvent("buyside", "confirmed", ph, bar_index, time, 0)
+        if array.size(buySideLevels) > maxLevelsStored
+            oldLvl = array.get(buySideLevels, 0)
+            if oldLvl.state != "retired"
+                oldLvl.forceRetired := true
+                oldLvl.state := "retired"
+                logEvent("buyside", "forceRetired", oldLvl.price, bar_index, time, 0)
+            removed = array.shift(buySideLevels)
+            line.delete(removed.lineRef)
+
+    if not na(pl) and showSellSide
+        LiqLevel lvl2 = LiqLevel.new(price=pl, pivotBarIndex=bar_index - pivotRightLen, pivotBarTime=time[pivotRightLen], confirmBarIndex=bar_index, confirmBarTime=time)
+        if showConfirmLag
+            lvl2.historicalRef := trackHistoricalLine(line.new(bar_index - pivotRightLen, pl, bar_index, pl, color=colHistorical, style=line.style_dotted))
+        lvl2.lineRef := line.new(bar_index, pl, bar_index, pl, color=color.new(colActive, 60), width=1, extend=extend.right)
+        array.push(sellSideLevels, lvl2)
+        logEvent("sellside", "confirmed", pl, bar_index, time, 0)
+        if array.size(sellSideLevels) > maxLevelsStored
+            oldLvl2 = array.get(sellSideLevels, 0)
+            if oldLvl2.state != "retired"
+                oldLvl2.forceRetired := true
+                oldLvl2.state := "retired"
+                logEvent("sellside", "forceRetired", oldLvl2.price, bar_index, time, 0)
+            removed2 = array.shift(sellSideLevels)
+            line.delete(removed2.lineRef)
+
+if barstate.isconfirmed and array.size(buySideLevels) > 0
+    nBuy = array.size(buySideLevels)
+    for i = 0 to nBuy - 1
+        lvl = array.get(buySideLevels, i)
+        lvl.displayed := fullDiagnosticMode or ((nBuy - i) <= maxLevelsDisplayed)
+        if lvl.state != "retired" and bar_index > lvl.confirmBarIndex
+            if not lvl.reached and high >= lvl.price
+                lvl.reached := true
+                lvl.reachedBarIndex := bar_index
+                lvl.reachedBarTime := time
+                if showReachedMarkers and lvl.displayed
+                    trackLabel(label.new(bar_index, lvl.price, text="reached", style=label.style_label_down, color=color.new(colActive, 60), textcolor=color.black, size=size.tiny))
+                logEvent("buyside", "reached", lvl.price, bar_index, time, 0)
+            if not lvl.closedBeyond
+                if lvl.excursionState == "none" and high > lvl.price
+                    lvl.excursionState := "beyond"
+                    lvl.tradedBeyond := true
+                    lvl.tradedBeyondBarIndex := bar_index
+                    lvl.tradedBeyondBarTime := time
+                    if showTradedBeyondMarkers and lvl.displayed
+                        trackLabel(label.new(bar_index, lvl.price, text="beyond", style=label.style_label_down, color=color.new(colBreached, 50), textcolor=color.black, size=size.tiny))
+                    logEvent("buyside", "tradedBeyond", lvl.price, bar_index, time, 0)
+                if lvl.excursionState == "beyond"
+                    if close > lvl.price
+                        lvl.closedBeyond := true
+                        lvl.closedBeyondBarIndex := bar_index
+                        lvl.closedBeyondBarTime := time
+                        lvl.state := "breached"
+                        lvl.excursionState := "closed"
+                        if showClosedBeyondMarkers and lvl.displayed
+                            if fullDiagnosticMode
+                                trackLabel(label.new(bar_index, lvl.price, text="closed beyond", style=label.style_label_down, color=colBreached, textcolor=color.white, size=size.tiny))
+                            else
+                                trackLabel(label.new(bar_index, lvl.price, text="", style=label.style_circle, color=colBreached, size=size.tiny))
+                        logEvent("buyside", "closedBeyond", lvl.price, bar_index, time, 0)
+                    else if close < lvl.price
+                        lvl.wickSweepCount += 1
+                        lvl.lastWickSweepBarIndex := bar_index
+                        lvl.lastWickSweepBarTime := time
+                        lvl.excursionState := "none"
+                        if showWickSweepMarkers and lvl.displayed
+                            if fullDiagnosticMode
+                                trackLabel(label.new(bar_index, lvl.price, text="wick sweep #" + str.tostring(lvl.wickSweepCount), style=label.style_label_down, color=colWickSweep, textcolor=color.white, size=size.tiny))
+                            else
+                                trackLabel(label.new(bar_index, lvl.price, text="", style=label.style_cross, color=colWickSweep, size=size.tiny))
+                        logEvent("buyside", "wickSweepReclaim", lvl.price, bar_index, time, lvl.wickSweepCount)
+                    else
+                        if showEqualCloseMarkers and lvl.displayed
+                            trackLabel(label.new(bar_index, lvl.price, text="close == level", style=label.style_label_down, color=colEqual, textcolor=color.black, size=size.tiny))
+                        logEvent("buyside", "equalClose", lvl.price, bar_index, time, 0)
+            if lvl.closedBeyond and not lvl.reclaimed and close < lvl.price
+                lvl.reclaimed := true
+                lvl.reclaimedBarIndex := bar_index
+                lvl.reclaimedBarTime := time
+                lvl.state := "reclaimed"
+                line.set_extend(lvl.lineRef, extend.none)
+                line.set_x2(lvl.lineRef, bar_index)
+                if showReclaimedMarkers and lvl.displayed
+                    if fullDiagnosticMode
+                        trackLabel(label.new(bar_index, lvl.price, text="reclaimed", style=label.style_label_down, color=colReclaimed, textcolor=color.white, size=size.tiny))
+                    else
+                        trackLabel(label.new(bar_index, lvl.price, text="", style=label.style_circle, color=colReclaimed, size=size.tiny))
+                logEvent("buyside", "reclaimed", lvl.price, bar_index, time, 0)
+            if lvl.state == "reclaimed" and not na(lvl.reclaimedBarIndex) and (bar_index - lvl.reclaimedBarIndex) > retireAfterBars
+                lvl.state := "retired"
+                logEvent("buyside", "retired", lvl.price, bar_index, time, 0)
+        if not lvl.displayed
+            line.set_color(lvl.lineRef, color.new(color.black, 100))
+        else if lvl.state == "active"
+            line.set_width(lvl.lineRef, fullDiagnosticMode ? 2 : 1)
+            line.set_color(lvl.lineRef, fullDiagnosticMode ? colActive : color.new(colActive, 60))
+        else if lvl.state == "breached"
+            line.set_width(lvl.lineRef, 2)
+            line.set_color(lvl.lineRef, colBreached)
+        else if lvl.state == "reclaimed"
+            line.set_width(lvl.lineRef, 2)
+            line.set_color(lvl.lineRef, colReclaimed)
+        else if lvl.state == "retired"
+            line.set_width(lvl.lineRef, 1)
+            line.set_color(lvl.lineRef, colRetired)
+
+if barstate.isconfirmed and array.size(sellSideLevels) > 0
+    nSell = array.size(sellSideLevels)
+    for i = 0 to nSell - 1
+        lvl = array.get(sellSideLevels, i)
+        lvl.displayed := fullDiagnosticMode or ((nSell - i) <= maxLevelsDisplayed)
+        if lvl.state != "retired" and bar_index > lvl.confirmBarIndex
+            if not lvl.reached and low <= lvl.price
+                lvl.reached := true
+                lvl.reachedBarIndex := bar_index
+                lvl.reachedBarTime := time
+                if showReachedMarkers and lvl.displayed
+                    trackLabel(label.new(bar_index, lvl.price, text="reached", style=label.style_label_up, color=color.new(colActive, 60), textcolor=color.black, size=size.tiny))
+                logEvent("sellside", "reached", lvl.price, bar_index, time, 0)
+            if not lvl.closedBeyond
+                if lvl.excursionState == "none" and low < lvl.price
+                    lvl.excursionState := "beyond"
+                    lvl.tradedBeyond := true
+                    lvl.tradedBeyondBarIndex := bar_index
+                    lvl.tradedBeyondBarTime := time
+                    if showTradedBeyondMarkers and lvl.displayed
+                        trackLabel(label.new(bar_index, lvl.price, text="beyond", style=label.style_label_up, color=color.new(colBreached, 50), textcolor=color.black, size=size.tiny))
+                    logEvent("sellside", "tradedBeyond", lvl.price, bar_index, time, 0)
+                if lvl.excursionState == "beyond"
+                    if close < lvl.price
+                        lvl.closedBeyond := true
+                        lvl.closedBeyondBarIndex := bar_index
+                        lvl.closedBeyondBarTime := time
+                        lvl.state := "breached"
+                        lvl.excursionState := "closed"
+                        if showClosedBeyondMarkers and lvl.displayed
+                            if fullDiagnosticMode
+                                trackLabel(label.new(bar_index, lvl.price, text="closed beyond", style=label.style_label_up, color=colBreached, textcolor=color.white, size=size.tiny))
+                            else
+                                trackLabel(label.new(bar_index, lvl.price, text="", style=label.style_circle, color=colBreached, size=size.tiny))
+                        logEvent("sellside", "closedBeyond", lvl.price, bar_index, time, 0)
+                    else if close > lvl.price
+                        lvl.wickSweepCount += 1
+                        lvl.lastWickSweepBarIndex := bar_index
+                        lvl.lastWickSweepBarTime := time
+                        lvl.excursionState := "none"
+                        if showWickSweepMarkers and lvl.displayed
+                            if fullDiagnosticMode
+                                trackLabel(label.new(bar_index, lvl.price, text="wick sweep #" + str.tostring(lvl.wickSweepCount), style=label.style_label_up, color=colWickSweep, textcolor=color.white, size=size.tiny))
+                            else
+                                trackLabel(label.new(bar_index, lvl.price, text="", style=label.style_cross, color=colWickSweep, size=size.tiny))
+                        logEvent("sellside", "wickSweepReclaim", lvl.price, bar_index, time, lvl.wickSweepCount)
+                    else
+                        if showEqualCloseMarkers and lvl.displayed
+                            trackLabel(label.new(bar_index, lvl.price, text="close == level", style=label.style_label_up, color=colEqual, textcolor=color.black, size=size.tiny))
+                        logEvent("sellside", "equalClose", lvl.price, bar_index, time, 0)
+            if lvl.closedBeyond and not lvl.reclaimed and close > lvl.price
+                lvl.reclaimed := true
+                lvl.reclaimedBarIndex := bar_index
+                lvl.reclaimedBarTime := time
+                lvl.state := "reclaimed"
+                line.set_extend(lvl.lineRef, extend.none)
+                line.set_x2(lvl.lineRef, bar_index)
+                if showReclaimedMarkers and lvl.displayed
+                    if fullDiagnosticMode
+                        trackLabel(label.new(bar_index, lvl.price, text="reclaimed", style=label.style_label_up, color=colReclaimed, textcolor=color.white, size=size.tiny))
+                    else
+                        trackLabel(label.new(bar_index, lvl.price, text="", style=label.style_circle, color=colReclaimed, size=size.tiny))
+                logEvent("sellside", "reclaimed", lvl.price, bar_index, time, 0)
+            if lvl.state == "reclaimed" and not na(lvl.reclaimedBarIndex) and (bar_index - lvl.reclaimedBarIndex) > retireAfterBars
+                lvl.state := "retired"
+                logEvent("sellside", "retired", lvl.price, bar_index, time, 0)
+        if not lvl.displayed
+            line.set_color(lvl.lineRef, color.new(color.black, 100))
+        else if lvl.state == "active"
+            line.set_width(lvl.lineRef, fullDiagnosticMode ? 2 : 1)
+            line.set_color(lvl.lineRef, fullDiagnosticMode ? colActive : color.new(colActive, 60))
+        else if lvl.state == "breached"
+            line.set_width(lvl.lineRef, 2)
+            line.set_color(lvl.lineRef, colBreached)
+        else if lvl.state == "reclaimed"
+            line.set_width(lvl.lineRef, 2)
+            line.set_color(lvl.lineRef, colReclaimed)
+        else if lvl.state == "retired"
+            line.set_width(lvl.lineRef, 1)
+            line.set_color(lvl.lineRef, colRetired)
+
+var table logT = table.new(position.bottom_right, 5, maxEventLogRows + 1, bgcolor=color.new(color.black, 70), border_color=color.gray, border_width=1)
+
+if showEventLogTable and barstate.islast
+    table.cell(logT, 0, 0, "Side", text_color=color.white, bgcolor=color.new(color.black, 50))
+    table.cell(logT, 1, 0, "Event", text_color=color.white, bgcolor=color.new(color.black, 50))
+    table.cell(logT, 2, 0, "Price", text_color=color.white, bgcolor=color.new(color.black, 50))
+    table.cell(logT, 3, 0, "Time", text_color=color.white, bgcolor=color.new(color.black, 50))
+    table.cell(logT, 4, 0, "#", text_color=color.white, bgcolor=color.new(color.black, 50))
+    for i = 0 to array.size(eventLog) - 1
+        e = array.get(eventLog, array.size(eventLog) - 1 - i)
+        table.cell(logT, 0, i + 1, e.side, text_color=color.white)
+        table.cell(logT, 1, i + 1, e.eventType, text_color=color.white)
+        table.cell(logT, 2, i + 1, str.tostring(e.price), text_color=color.white)
+        table.cell(logT, 3, i + 1, str.format_time(e.barTime, "MM-dd HH:mm", syminfo.timezone), text_color=color.white)
+        table.cell(logT, 4, i + 1, e.occurrence > 0 ? str.tostring(e.occurrence) : "-", text_color=color.white)
