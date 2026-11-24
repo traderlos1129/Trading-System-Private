@@ -1,0 +1,237 @@
+//@version=6
+indicator("HTF Context Module (Weekly/Daily/4H/1H)", shorttitle="HTFCtx", overlay=true, max_lines_count=400, max_labels_count=400, max_boxes_count=100)
+
+// ============================================================================
+// NON-REPAINTING HTF ACCESS PATTERN:
+// Every HTF field is requested as expression[1] (the PREVIOUS, fully-closed HTF
+// bar) combined with lookahead=barmerge.lookahead_on. The [1] offset + lookahead_on
+// combination returns the most recently CLOSED higher-timeframe bar identically
+// on historical, replay, and realtime bars - never a forming/live HTF bar, and
+// never mismatched between modes. ([1] + lookahead_off double-offsets on
+// historical bars and disagrees with realtime - deliberately not used here.)
+// ============================================================================
+
+// ---- Levers ----
+pivotLen         = input.int(2, "Swing confirmation length (confirmed HTF bars each side)", minval=1, maxval=10, group="Structure")
+maxHtfBarsStored = input.int(60, "Max confirmed HTF bars stored per timeframe", minval=20, maxval=200, group="Resource Management")
+maxLiqStored     = input.int(6, "Max liquidity levels stored/shown per side, per timeframe", minval=2, maxval=30, group="Resource Management")
+
+tfWeekly = input.timeframe("W",   "Weekly timeframe", group="Timeframes")
+tfDaily  = input.timeframe("D",   "Daily timeframe", group="Timeframes")
+tf4H     = input.timeframe("240", "4H timeframe", group="Timeframes")
+tf1H     = input.timeframe("60",  "1H timeframe", group="Timeframes")
+
+showWeekly = input.bool(true, "Show Weekly row/lines", group="Timeframes")
+showDaily  = input.bool(true, "Show Daily row/lines", group="Timeframes")
+show4H     = input.bool(true, "Show 4H row/lines", group="Timeframes")
+show1H     = input.bool(true, "Show 1H row/lines", group="Timeframes")
+
+showLiquidityLines = input.bool(true, "Show HTF liquidity level lines", group="Display")
+showLiveDescriptor = input.bool(true, "Show live retracement/continuation column", group="Display")
+tablePosStr         = input.string("Top Right", "Dashboard position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group="Display")
+
+colBullish   = input.color(color.teal, "Bullish color", group="Colors")
+colBearish   = input.color(color.maroon, "Bearish color", group="Colors")
+colNeutral   = input.color(color.gray, "Neutral color", group="Colors")
+colLiquidity = input.color(color.orange, "Liquidity level color", group="Colors")
+
+// ---- Types ----
+type HTFState
+    string tf
+    array<float> highs
+    array<float> lows
+    array<int>   times
+    int    lastProcessedTime = na
+    float  swingHighPrice = na
+    int    swingHighTime = na
+    float  swingLowPrice = na
+    int    swingLowTime = na
+    string bias = "Neutral"
+    string lastEventType = "None"
+    int    lastEventTime = na
+    array<float> liqHighPrices
+    array<int>   liqHighTimes
+    array<line>  liqHighLines
+    array<float> liqLowPrices
+    array<int>   liqLowTimes
+    array<line>  liqLowLines
+
+f_newState(tfName) =>
+    HTFState.new(tf=tfName, highs=array.new<float>(), lows=array.new<float>(), times=array.new<int>(), liqHighPrices=array.new<float>(), liqHighTimes=array.new<int>(), liqHighLines=array.new<line>(), liqLowPrices=array.new<float>(), liqLowTimes=array.new<int>(), liqLowLines=array.new<line>())
+
+var HTFState W  = f_newState("W")
+var HTFState D  = f_newState("D")
+var HTFState H4 = f_newState("240")
+var HTFState H1 = f_newState("60")
+
+// ---- Timeframe validity guard ----
+chartSeconds = timeframe.in_seconds(timeframe.period)
+f_tfValid(tfStr) =>
+    timeframe.in_seconds(tfStr) > chartSeconds
+validW  = f_tfValid(tfWeekly)
+validD  = f_tfValid(tfDaily)
+valid4H = f_tfValid(tf4H)
+valid1H = f_tfValid(tf1H)
+
+// ---- HTF confirmed-bar requests (non-repainting pattern) ----
+[w_o, w_h, w_l, w_c, w_t] = request.security(syminfo.tickerid, tfWeekly, [open[1], high[1], low[1], close[1], time[1]], lookahead=barmerge.lookahead_on)
+[d_o, d_h, d_l, d_c, d_t] = request.security(syminfo.tickerid, tfDaily, [open[1], high[1], low[1], close[1], time[1]], lookahead=barmerge.lookahead_on)
+[h4_o, h4_h, h4_l, h4_c, h4_t] = request.security(syminfo.tickerid, tf4H, [open[1], high[1], low[1], close[1], time[1]], lookahead=barmerge.lookahead_on)
+[h1_o, h1_h, h1_l, h1_c, h1_t] = request.security(syminfo.tickerid, tf1H, [open[1], high[1], low[1], close[1], time[1]], lookahead=barmerge.lookahead_on)
+
+// ---- Core processing (called once per TF per confirmed chart bar; internally
+//      deduped to fire exactly once per genuinely new confirmed HTF close) ----
+f_processHTF(HTFState s, bool valid, float o, float h, float l, float c, int t, int pLen, int maxBars, int maxLiq) =>
+    if valid and not na(t)
+        bool isNewBar = na(s.lastProcessedTime) or t != s.lastProcessedTime
+        if isNewBar
+            s.lastProcessedTime := t
+
+            // 1) BREAK TEST FIRST, against swing levels established by PRIOR bars only.
+            //    Confirmed CLOSE only - never wick - so a liquidity sweep is never
+            //    confused with a structural break.
+            if not na(s.swingHighPrice) and c > s.swingHighPrice
+                if s.bias == "Neutral"
+                    s.lastEventType := "Initial Bullish Structure"
+                else if s.bias == "Bearish"
+                    s.lastEventType := "Bullish CHoCH"
+                else
+                    s.lastEventType := "Bullish BOS"
+                s.bias := "Bullish"
+                s.lastEventTime := t
+            else if not na(s.swingLowPrice) and c < s.swingLowPrice
+                if s.bias == "Neutral"
+                    s.lastEventType := "Initial Bearish Structure"
+                else if s.bias == "Bullish"
+                    s.lastEventType := "Bearish CHoCH"
+                else
+                    s.lastEventType := "Bearish BOS"
+                s.bias := "Bearish"
+                s.lastEventTime := t
+
+            // 2) Liquidity sweep bookkeeping - wick-based, informational only,
+            //    never touches bias. Removes any stored level this bar's wick traded through.
+            if array.size(s.liqHighPrices) > 0
+                for i = array.size(s.liqHighPrices) - 1 to 0
+                    if h >= array.get(s.liqHighPrices, i)
+                        array.remove(s.liqHighPrices, i)
+                        array.remove(s.liqHighTimes, i)
+                        lnR = array.remove(s.liqHighLines, i)
+                        if not na(lnR)
+                            line.delete(lnR)
+            if array.size(s.liqLowPrices) > 0
+                for i = array.size(s.liqLowPrices) - 1 to 0
+                    if l <= array.get(s.liqLowPrices, i)
+                        array.remove(s.liqLowPrices, i)
+                        array.remove(s.liqLowTimes, i)
+                        lnR2 = array.remove(s.liqLowLines, i)
+                        if not na(lnR2)
+                            line.delete(lnR2)
+
+            // 3) Store the new confirmed HTF bar
+            array.push(s.highs, h)
+            array.push(s.lows, l)
+            array.push(s.times, t)
+            if array.size(s.highs) > maxBars
+                array.shift(s.highs)
+                array.shift(s.lows)
+                array.shift(s.times)
+
+            // 4) Pivot confirmation - uses a bar pLen positions back, never the
+            //    newest bar's own data confirming itself (next-bar discipline).
+            n = array.size(s.times)
+            checkIdx = n - 1 - pLen
+            if checkIdx >= pLen
+                candH = array.get(s.highs, checkIdx)
+                candL = array.get(s.lows, checkIdx)
+                isPivH = true
+                isPivL = true
+                for k = checkIdx - pLen to checkIdx + pLen
+                    if k != checkIdx
+                        if array.get(s.highs, k) >= candH
+                            isPivH := false
+                        if array.get(s.lows, k) <= candL
+                            isPivL := false
+                pivTime = array.get(s.times, checkIdx)
+                if isPivH
+                    s.swingHighPrice := candH
+                    s.swingHighTime := pivTime
+                    array.push(s.liqHighPrices, candH)
+                    array.push(s.liqHighTimes, pivTime)
+                    lnH = showLiquidityLines ? line.new(bar_index, candH, bar_index + 1, candH, extend=extend.right, color=colLiquidity, width=1, style=line.style_dotted) : line(na)
+                    array.push(s.liqHighLines, lnH)
+                    if array.size(s.liqHighPrices) > maxLiq
+                        array.shift(s.liqHighPrices)
+                        array.shift(s.liqHighTimes)
+                        oldLnH = array.shift(s.liqHighLines)
+                        if not na(oldLnH)
+                            line.delete(oldLnH)
+                if isPivL
+                    s.swingLowPrice := candL
+                    s.swingLowTime := pivTime
+                    array.push(s.liqLowPrices, candL)
+                    array.push(s.liqLowTimes, pivTime)
+                    lnL = showLiquidityLines ? line.new(bar_index, candL, bar_index + 1, candL, extend=extend.right, color=colLiquidity, width=1, style=line.style_dotted) : line(na)
+                    array.push(s.liqLowLines, lnL)
+                    if array.size(s.liqLowPrices) > maxLiq
+                        array.shift(s.liqLowPrices)
+                        array.shift(s.liqLowTimes)
+                        oldLnL = array.shift(s.liqLowLines)
+                        if not na(oldLnL)
+                            line.delete(oldLnL)
+
+if barstate.isconfirmed
+    f_processHTF(W, validW, w_o, w_h, w_l, w_c, w_t, pivotLen, maxHtfBarsStored, maxLiqStored)
+    f_processHTF(D, validD, d_o, d_h, d_l, d_c, d_t, pivotLen, maxHtfBarsStored, maxLiqStored)
+    f_processHTF(H4, valid4H, h4_o, h4_h, h4_l, h4_c, h4_t, pivotLen, maxHtfBarsStored, maxLiqStored)
+    f_processHTF(H1, valid1H, h1_o, h1_h, h1_l, h1_c, h1_t, pivotLen, maxHtfBarsStored, maxLiqStored)
+
+// ---- Live (provisional) retracement/continuation descriptor - never mutates stored state ----
+f_describe(HTFState s, float liveClose) =>
+    string desc = "Neutral"
+    if s.bias == "Bullish" and not na(s.swingHighPrice)
+        desc := liveClose >= s.swingHighPrice ? "Continuation" : "Retracement"
+    else if s.bias == "Bearish" and not na(s.swingLowPrice)
+        desc := liveClose <= s.swingLowPrice ? "Continuation" : "Retracement"
+    desc
+
+// ---- Dashboard ----
+f_biasColor(string bias) =>
+    bias == "Bullish" ? colBullish : bias == "Bearish" ? colBearish : colNeutral
+
+f_renderRow(table t, int row, string label, HTFState s, bool tfValid, bool enabled, bool liveDescOn) =>
+    if not enabled
+        table.cell(t, 0, row, label, text_color=color.gray, bgcolor=color.new(color.black, 50))
+        table.cell(t, 1, row, "Hidden", text_color=color.gray)
+        table.cell(t, 2, row, "", text_color=color.gray)
+        table.cell(t, 3, row, "", text_color=color.gray)
+        table.cell(t, 4, row, "", text_color=color.gray)
+        table.cell(t, 5, row, "", text_color=color.gray)
+    else if not tfValid
+        table.cell(t, 0, row, label, text_color=color.gray, bgcolor=color.new(color.black, 50))
+        table.cell(t, 1, row, "Invalid TF", text_color=color.orange)
+        table.cell(t, 2, row, "chart TF too high", text_color=color.gray)
+        table.cell(t, 3, row, "—", text_color=color.gray)
+        table.cell(t, 4, row, "—", text_color=color.gray)
+        table.cell(t, 5, row, "—", text_color=color.gray)
+    else
+        table.cell(t, 0, row, label, text_color=color.white, bgcolor=color.new(color.black, 50))
+        table.cell(t, 1, row, s.bias, text_color=color.white, bgcolor=f_biasColor(s.bias))
+        table.cell(t, 2, row, s.lastEventType, text_color=color.white)
+        table.cell(t, 3, row, na(s.swingHighPrice) ? "—" : str.tostring(s.swingHighPrice), text_color=color.white)
+        table.cell(t, 4, row, na(s.swingLowPrice) ? "—" : str.tostring(s.swingLowPrice), text_color=color.white)
+        table.cell(t, 5, row, liveDescOn ? f_describe(s, close) : "", text_color=color.white)
+
+var table dash = table.new(position = tablePosStr == "Top Right" ? position.top_right : tablePosStr == "Top Left" ? position.top_left : tablePosStr == "Bottom Right" ? position.bottom_right : position.bottom_left, columns = 6, rows = 5, bgcolor = color.new(color.black, 70), border_color = color.gray, border_width = 1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "TF", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(dash, 1, 0, "Bias", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(dash, 2, 0, "Last Event", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(dash, 3, 0, "Swing High", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(dash, 4, 0, "Swing Low", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(dash, 5, 0, "Live Price Action", text_color=color.white, bgcolor=color.new(color.black, 30))
+    f_renderRow(dash, 1, "Weekly", W, validW, showWeekly, showLiveDescriptor)
+    f_renderRow(dash, 2, "Daily", D, validD, showDaily, showLiveDescriptor)
+    f_renderRow(dash, 3, "4H", H4, valid4H, show4H, showLiveDescriptor)
+    f_renderRow(dash, 4, "1H", H1, valid1H, show1H, showLiveDescriptor)
